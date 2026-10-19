@@ -82,7 +82,7 @@ The division of labour is intentional:
 4. For a baseline comparison, disable other chroma-preparation shaders and keep the renderer's resize filter and post-resize shaders unchanged.
 5. Compare the same frames with ChromaWeave enabled and disabled. Start with saturated colour edges, broad flat fills, thin coloured details, and soft gradients.
 
-The shader uses `DEBUG_MODE` as a compile-time setting in the TXT file. PotPlayer does not expose these `#define` values as runtime controls. Change the value manually and reload or recompile the shader to switch modes.
+The shader uses `DEBUG_MODE` as a compile-time setting in the TXT file. PotPlayer does not expose these `#define` values as runtime controls. Change the value manually, save the txt (ctrl-s) and disable/enable the shader to apply the new config (configure a shortcut in F2 menu, easier).
 
 ## How the algorithm works
 

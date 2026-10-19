@@ -1,0 +1,573 @@
+/*
+    ChromaWeave Adaptive Repair — pre-resize chroma cleanup
+    Version: 1.0
+
+    Purpose:
+      Reduce selected chroma irregularities before resizing, while protecting
+      coherent colour edges and fine image detail.
+
+    How it works:
+      - Analyses local luminance and chroma gradients to detect image edges.
+      - Combines guided 3x3 and 5x5 chroma estimates, adapting their blend to
+        local edges, texture, and fine-detail support.
+      - Repairs isolated chroma outliers only when neighbouring samples agree
+        and the surrounding image structure does not explain the deviation.
+      - Limits corrections around supported fine colour features and strong edges.
+      - Reconstructs RGB while preserving the centre pixel's luminance and alpha.
+
+    Intended placement:
+      ChromaWeave (Pre-Resize) -> renderer resize -> optional post-resize shader.
+      Compare playback with the shader enabled and disabled before adding other
+      chroma-processing stages.
+
+    Limitations:
+      The shader receives decoded RGB, not the decoder's native 4:2:0 chroma
+      planes. It cannot restore discarded information or identify every real
+      colour detail and compression artefact perfectly. It is a spatial helper,
+      not a codec-aware deblocker, temporal filter, sharpening pass, or upscaler.
+
+    Diagnostic modes:
+      DEBUG_MODE is set manually in this file. Mode 0 is normal output; mode 1
+      is a solid-magenta branch check; mode 2 shows fine-detail confidence; mode 3
+      shows outlier magnitude, neighbour spread, and repair confidence; mode 4
+      shows a lightweight chroma-repair activity proxy; mode 5 shows raw local
+      chroma deviation; mode 6 shows the requested correction; mode 7 shows
+      isolated-outlier candidate confidence. Diagnostic maps are indicators,
+      not pixel-exact maps of the full correction.
+
+    Compatibility: PotPlayer-style HLSL Pixel Shader 3.0 syntax.
+    Sampling: 25 texture fetches per output pixel in the normal image path.
+    Performance depends on the renderer, shader compiler, GPU, and driver.
+*/
+
+sampler s0 : register(s0);
+float4 p0 : register(c0);
+float4 p1 : register(c1);
+
+#define width  (p0[0])
+#define height (p0[1])
+
+// --- Main tuning controls ------------------------------------------------
+#define MAX_CHROMA_REPAIR          0.58
+#define CHROMA_CHANGE_FLOOR        0.0040
+#define CHROMA_CHANGE_GAIN         24.0
+#define LUMA_RANGE_REJECTION       4.2
+#define LUMA_EDGE_GAIN             2.2
+#define LUMA_CROSS_EDGE_REJECTION  2.0
+#define WIDE_ESTIMATE_BLEND        0.66
+
+// --- Fine-detail protection ---------------------------------------------
+// A neighbour is considered chromatically similar when its Cb/Cr distance
+// from the centre falls within this soft radius.
+#define FINE_DETAIL_SIMILARITY_RADIUS  0.052
+#define FINE_DETAIL_SIMILARITY_GAIN   24.0
+#define FINE_DETAIL_CONTRAST_FLOOR     0.016
+#define FINE_DETAIL_CONTRAST_GAIN     16.0
+// Reduce broad/local repair where the neighbourhood supports a coherent fine
+// feature. Outlier protection is deliberately strongest to avoid erasing thin
+// coloured lines. Set controls to 0.0 to disable each protection path.
+#define FINE_DETAIL_WIDE_GUARD         0.88
+#define FINE_DETAIL_MAIN_GUARD         0.86
+#define FINE_DETAIL_OUTLIER_GUARD      0.98
+
+// --- Diagnostic modes (compile-time; edit DEBUG_MODE manually) ----------
+// 0 = normal output (default)
+// 1 = SOLID MAGENTA: diagnostic branch/load sanity check. Must not show the movie.
+// 2 = grayscale fine-detail protection confidence
+// 3 = R=outlier magnitude, G=neighbour spread, B=final repair confidence (content-scaled)
+// 4 = black/white proxy of local chroma-repair activity (early low-cost diagnostic path)
+// 5 = black/white map of raw centre-to-neighbour chroma deviation (early low-cost path)
+// 6 = grayscale map of requested target chroma difference before correction gain
+// 7 = grayscale confidence map for isolated-chroma outlier candidates
+#define DEBUG_MODE                    0
+
+// --- Chroma-edge controls ------------------------------------------------
+// A coherent Cb/Cr edge is protected even when the luma edge is weak.
+#define CHROMA_EDGE_GAIN           4.0
+#define CHROMA_EDGE_PROTECTION     0.82
+#define CHROMA_CROSS_EDGE_REJECT   2.0
+
+// Isolated-colour repair: low neighbour spread indicates consensus.
+#define OUTLIER_DELTA_THRESHOLD    0.015
+#define OUTLIER_DELTA_GAIN         22.0
+#define OUTLIER_SPREAD_LIMIT       0.038
+#define OUTLIER_SPREAD_GAIN        28.0
+#define OUTLIER_REPAIR_STRENGTH    0.78
+
+// Additional restraint on the main correction near strong luma or chroma edges.
+#define FINAL_LUMA_EDGE_GUARD      0.20
+#define FINAL_CHROMA_EDGE_GUARD    0.12
+
+// High local luma texture reduces the influence of the wider chroma estimate.
+#define LUMA_TEXTURE_GAIN          3.2
+#define SOURCE_TEXTURE_REJECTION   0.48
+
+float4 toSignal(float4 rgb)
+{
+    float y  = dot(rgb.rgb, float3(0.299000, 0.587000, 0.114000));
+    float cb = (rgb.b - y) * 0.564334;
+    float cr = (rgb.r - y) * 0.713266;
+    return float4(y, cb, cr, rgb.a);
+}
+
+float4 readSignal(float2 uv, float offsetX, float offsetY)
+{
+    float2 sampleUV = uv + float2(offsetX / width, offsetY / height);
+    return toSignal(tex2D(s0, sampleUV));
+}
+
+float guidedWeight(float sampleY, float centreY, float2 offset,
+                   float2 lumaNormal, float lumaEdgeConfidence,
+                   float2 chromaNormal, float chromaEdgeConfidence,
+                   float spatialWeight)
+{
+    float lumaDistance = abs(sampleY - centreY) * LUMA_RANGE_REJECTION;
+    float lumaCross = abs(dot(lumaNormal, offset))
+                    * lumaEdgeConfidence * LUMA_CROSS_EDGE_REJECTION;
+    float chromaCross = abs(dot(chromaNormal, offset))
+                      * chromaEdgeConfidence * CHROMA_CROSS_EDGE_REJECT;
+
+    float totalDistance = lumaDistance + lumaCross + chromaCross;
+    return spatialWeight / (1.0 + totalDistance * totalDistance);
+}
+
+float2 safeNormal(float2 g)
+{
+    return g / (sqrt(dot(g, g)) + 0.0001);
+}
+
+float chromaDistance(float2 a, float2 b)
+{
+    float2 d = a - b;
+    return sqrt(dot(d, d));
+}
+
+float detailSimilarity(float2 sampleChroma, float2 centreChroma)
+{
+    float d = chromaDistance(sampleChroma, centreChroma);
+    return saturate((FINE_DETAIL_SIMILARITY_RADIUS - d)
+                    * FINE_DETAIL_SIMILARITY_GAIN);
+}
+
+float gradientMagnitude(float2 g)
+{
+    return sqrt(dot(g, g));
+}
+
+float4 main(float2 tex : TEXCOORD0) : COLOR
+{
+#if DEBUG_MODE == 1
+    // Branch/load check: the whole frame should be magenta.
+    return float4(1.0, 0.0, 1.0, 1.0);
+#else
+#if DEBUG_MODE == 4
+    // Lightweight map of local chroma-repair activity. It uses an 8-neighbour
+    // estimate instead of the full 5x5 pipeline; brighter pixels indicate a
+    // larger difference between centre chroma and the local estimate.
+    float4 centre4 = readSignal(tex,  0.0,  0.0);
+    float2 centreC = centre4.yz;
+    float4 s00 = readSignal(tex, -1.0, -1.0);
+    float2 n00 = s00.yz;
+    float4 s01 = readSignal(tex,  0.0, -1.0);
+    float2 n01 = s01.yz;
+    float4 s02 = readSignal(tex,  1.0, -1.0);
+    float2 n02 = s02.yz;
+    float4 s10 = readSignal(tex, -1.0,  0.0);
+    float2 n10 = s10.yz;
+    float4 s12 = readSignal(tex,  1.0,  0.0);
+    float2 n12 = s12.yz;
+    float4 s20 = readSignal(tex, -1.0,  1.0);
+    float2 n20 = s20.yz;
+    float4 s21 = readSignal(tex,  0.0,  1.0);
+    float2 n21 = s21.yz;
+    float4 s22 = readSignal(tex,  1.0,  1.0);
+    float2 n22 = s22.yz;
+    float2 neighbourEstimate = (n00 + n02 + n20 + n22
+                              + 2.0 * (n01 + n10 + n12 + n21)) / 12.0;
+    float2 deltaC = centreC - neighbourEstimate;
+    float localDelta = sqrt(dot(deltaC, deltaC));
+    float activity = saturate((localDelta - 0.0025) * 48.0);
+    activity = sqrt(saturate(activity));
+    return float4(activity, activity, activity, 1.0);
+#else
+#if DEBUG_MODE == 5
+    // Raw chroma-deviation map, before outlier thresholds. Black means the centre
+    // agrees with the 8-neighbour mean; brighter values indicate a larger difference.
+    // This shows local variation, not whether that variation is an artefact.
+    float4 centre4 = readSignal(tex, 0.0, 0.0);
+    float4 a00 = readSignal(tex, -1.0, -1.0);
+    float4 a01 = readSignal(tex,  0.0, -1.0);
+    float4 a02 = readSignal(tex,  1.0, -1.0);
+    float4 a10 = readSignal(tex, -1.0,  0.0);
+    float4 a12 = readSignal(tex,  1.0,  0.0);
+    float4 a20 = readSignal(tex, -1.0,  1.0);
+    float4 a21 = readSignal(tex,  0.0,  1.0);
+    float4 a22 = readSignal(tex,  1.0,  1.0);
+    float2 neighbourMean = (a00.yz + a01.yz + a02.yz + a10.yz
+                          + a12.yz + a20.yz + a21.yz + a22.yz) / 8.0;
+    float2 deltaC = centre4.yz - neighbourMean;
+    float rawDelta = sqrt(dot(deltaC, deltaC));
+    // Gamma-like lift keeps small but real differences visible on 8-bit output.
+    float mapValue = sqrt(saturate(rawDelta * 40.0));
+    return float4(mapValue, mapValue, mapValue, 1.0);
+#else
+#if DEBUG_MODE == 7
+    // Isolated-outlier candidate map. A deviation is dimmed when neighbour consensus
+    // is weak or a local luminance edge suggests that it may be a real feature.
+    float4 centre4 = readSignal(tex,  0.0,  0.0);
+    float4 a00 = readSignal(tex, -1.0, -1.0);
+    float4 a01 = readSignal(tex,  0.0, -1.0);
+    float4 a02 = readSignal(tex,  1.0, -1.0);
+    float4 a10 = readSignal(tex, -1.0,  0.0);
+    float4 a12 = readSignal(tex,  1.0,  0.0);
+    float4 a20 = readSignal(tex, -1.0,  1.0);
+    float4 a21 = readSignal(tex,  0.0,  1.0);
+    float4 a22 = readSignal(tex,  1.0,  1.0);
+    float2 neighbourMean = (a00.yz + a01.yz + a02.yz + a10.yz
+                          + a12.yz + a20.yz + a21.yz + a22.yz) / 8.0;
+    float2 neighbourMoment = (a00.yz*a00.yz + a01.yz*a01.yz
+                            + a02.yz*a02.yz + a10.yz*a10.yz
+                            + a12.yz*a12.yz + a20.yz*a20.yz
+                            + a21.yz*a21.yz + a22.yz*a22.yz) / 8.0;
+    float2 neighbourVar = max(neighbourMoment - neighbourMean*neighbourMean,
+                              float2(0.0, 0.0));
+    float neighbourSpread = sqrt(neighbourVar.x + neighbourVar.y);
+    float2 centreDeltaC = centre4.yz - neighbourMean;
+    float centreDelta = sqrt(dot(centreDeltaC, centreDeltaC));
+    float anomaly = saturate((centreDelta - OUTLIER_DELTA_THRESHOLD)
+                           * OUTLIER_DELTA_GAIN);
+    float consensus = saturate((OUTLIER_SPREAD_LIMIT - neighbourSpread)
+                             * OUTLIER_SPREAD_GAIN);
+    float yMin = min(centre4.x, a00.x);
+    yMin = min(yMin, a01.x); yMin = min(yMin, a02.x);
+    yMin = min(yMin, a10.x); yMin = min(yMin, a12.x);
+    yMin = min(yMin, a20.x); yMin = min(yMin, a21.x); yMin = min(yMin, a22.x);
+    float yMax = max(centre4.x, a00.x);
+    yMax = max(yMax, a01.x); yMax = max(yMax, a02.x);
+    yMax = max(yMax, a10.x); yMax = max(yMax, a12.x); yMax = max(yMax, a20.x);
+    yMax = max(yMax, a21.x); yMax = max(yMax, a22.x);
+    float lumaEdgeGuard = saturate(1.0 - (yMax - yMin) * 4.0);
+    float candidate = saturate(anomaly * consensus * lumaEdgeGuard);
+    candidate = sqrt(candidate);
+    return float4(candidate, candidate, candidate, 1.0);
+#else
+    // Neighbourhood offsets are measured in decoded source-pixel units.
+    float4 c00 = readSignal(tex, -2.0, -2.0);
+    float4 c01 = readSignal(tex, -1.0, -2.0);
+    float4 c02 = readSignal(tex,  0.0, -2.0);
+    float4 c03 = readSignal(tex,  1.0, -2.0);
+    float4 c04 = readSignal(tex,  2.0, -2.0);
+
+    float4 c10 = readSignal(tex, -2.0, -1.0);
+    float4 c11 = readSignal(tex, -1.0, -1.0);
+    float4 c12 = readSignal(tex,  0.0, -1.0);
+    float4 c13 = readSignal(tex,  1.0, -1.0);
+    float4 c14 = readSignal(tex,  2.0, -1.0);
+
+    float4 c20 = readSignal(tex, -2.0,  0.0);
+    float4 c21 = readSignal(tex, -1.0,  0.0);
+    float4 c22 = readSignal(tex,  0.0,  0.0);
+    float4 c23 = readSignal(tex,  1.0,  0.0);
+    float4 c24 = readSignal(tex,  2.0,  0.0);
+
+    float4 c30 = readSignal(tex, -2.0,  1.0);
+    float4 c31 = readSignal(tex, -1.0,  1.0);
+    float4 c32 = readSignal(tex,  0.0,  1.0);
+    float4 c33 = readSignal(tex,  1.0,  1.0);
+    float4 c34 = readSignal(tex,  2.0,  1.0);
+
+    float4 c40 = readSignal(tex, -2.0,  2.0);
+    float4 c41 = readSignal(tex, -1.0,  2.0);
+    float4 c42 = readSignal(tex,  0.0,  2.0);
+    float4 c43 = readSignal(tex,  1.0,  2.0);
+    float4 c44 = readSignal(tex,  2.0,  2.0);
+
+    float centreY = c22.x;
+    float2 centreChroma = c22.yz;
+
+    // --- 1) Luma-edge direction --------------------------------------------
+    float lumaGx = (c13.x + 2.0*c23.x + c33.x
+                  - c11.x - 2.0*c21.x - c31.x) * 0.25;
+    float lumaGy = (c31.x + 2.0*c32.x + c33.x
+                  - c11.x - 2.0*c12.x - c13.x) * 0.25;
+    float lumaGradMag = sqrt(lumaGx*lumaGx + lumaGy*lumaGy);
+    float2 lumaNormal = float2(lumaGx, lumaGy) / (lumaGradMag + 0.0001);
+    float lumaEdgeConfidence = saturate(lumaGradMag * LUMA_EDGE_GAIN);
+
+    // --- 2) Chroma-edge direction ------------------------------------------
+    // Independent Cb/Cr gradients help detect colour edges with little luminance contrast.
+    float cbGx = (c13.y + 2.0*c23.y + c33.y
+                - c11.y - 2.0*c21.y - c31.y) * 0.25;
+    float cbGy = (c31.y + 2.0*c32.y + c33.y
+                - c11.y - 2.0*c12.y - c13.y) * 0.25;
+    float crGx = (c13.z + 2.0*c23.z + c33.z
+                - c11.z - 2.0*c21.z - c31.z) * 0.25;
+    float crGy = (c31.z + 2.0*c32.z + c33.z
+                - c11.z - 2.0*c12.z - c13.z) * 0.25;
+
+    float cbGradMag = sqrt(cbGx*cbGx + cbGy*cbGy);
+    float crGradMag = sqrt(crGx*crGx + crGy*crGy);
+    float useCbGradient = (cbGradMag >= crGradMag) ? 1.0 : 0.0;
+    float2 chromaGradient = lerp(float2(crGx, crGy), float2(cbGx, cbGy), useCbGradient);
+    float chromaGradMag = gradientMagnitude(chromaGradient);
+    float2 chromaNormal = chromaGradient / (chromaGradMag + 0.0001);
+    float chromaEdgeStrength = saturate(chromaGradMag * CHROMA_EDGE_GAIN);
+
+    // Check whether the dominant chromatic gradient continues along the edge.
+    // Adjacent gradients are estimated from the existing 5x5 samples.
+    float2 cbGradTop    = float2((c13.y-c11.y)*0.5, (c22.y-c02.y)*0.5);
+    float2 cbGradBottom = float2((c33.y-c31.y)*0.5, (c42.y-c22.y)*0.5);
+    float2 cbGradLeft   = float2((c22.y-c20.y)*0.5, (c31.y-c11.y)*0.5);
+    float2 cbGradRight  = float2((c24.y-c22.y)*0.5, (c33.y-c13.y)*0.5);
+
+    float2 crGradTop    = float2((c13.z-c11.z)*0.5, (c22.z-c02.z)*0.5);
+    float2 crGradBottom = float2((c33.z-c31.z)*0.5, (c42.z-c22.z)*0.5);
+    float2 crGradLeft   = float2((c22.z-c20.z)*0.5, (c31.z-c11.z)*0.5);
+    float2 crGradRight  = float2((c24.z-c22.z)*0.5, (c33.z-c13.z)*0.5);
+
+    float2 gradTop    = lerp(crGradTop,    cbGradTop,    useCbGradient);
+    float2 gradBottom = lerp(crGradBottom, cbGradBottom, useCbGradient);
+    float2 gradLeft   = lerp(crGradLeft,   cbGradLeft,   useCbGradient);
+    float2 gradRight  = lerp(crGradRight,  cbGradRight,  useCbGradient);
+
+    // The tangent runs perpendicular to the edge normal.
+    float horizontalNormal = (abs(chromaNormal.x) >= abs(chromaNormal.y)) ? 1.0 : 0.0;
+    float2 gradAlongA = lerp(gradLeft, gradTop, horizontalNormal);
+    float2 gradAlongB = lerp(gradRight, gradBottom, horizontalNormal);
+    float magAlongA = gradientMagnitude(gradAlongA);
+    float magAlongB = gradientMagnitude(gradAlongB);
+    float alignAlongA = saturate(dot(chromaNormal, safeNormal(gradAlongA)));
+    float alignAlongB = saturate(dot(chromaNormal, safeNormal(gradAlongB)));
+    float edgeSupport = saturate(min(magAlongA, magAlongB) * CHROMA_EDGE_GAIN);
+    float chromaEdgeCoherence = 0.5 * (alignAlongA + alignAlongB) * edgeSupport;
+    float coherentChromaEdge = chromaEdgeStrength * chromaEdgeCoherence;
+    float chromaEdgeConfidence = CHROMA_EDGE_PROTECTION * coherentChromaEdge;
+
+    // --- 2b) Fine chroma-detail support ------------------------------------
+    // A thin colour feature often continues along one axis: the centre and samples
+    // along its tangent have similar chroma, while samples across it differ.
+    // An isolated outlier usually has less support along the tangent.
+    float simL  = detailSimilarity(c21.yz, centreChroma);
+    float simR  = detailSimilarity(c23.yz, centreChroma);
+    float simT  = detailSimilarity(c12.yz, centreChroma);
+    float simB  = detailSimilarity(c32.yz, centreChroma);
+    float simTL = detailSimilarity(c11.yz, centreChroma);
+    float simTR = detailSimilarity(c13.yz, centreChroma);
+    float simBL = detailSimilarity(c31.yz, centreChroma);
+    float simBR = detailSimilarity(c33.yz, centreChroma);
+
+    float supportHorizontal = min(simL, simR);
+    float supportVertical   = min(simT, simB);
+    float supportDiagA      = min(simTL, simBR);
+    float supportDiagB      = min(simTR, simBL);
+    float tangentSupport = max(max(supportHorizontal, supportVertical),
+                               max(supportDiagA, supportDiagB));
+
+    float maxCardinalChromaDelta = max(max(chromaDistance(c21.yz, centreChroma),
+                                            chromaDistance(c23.yz, centreChroma)),
+                                       max(chromaDistance(c12.yz, centreChroma),
+                                           chromaDistance(c32.yz, centreChroma)));
+    float detailContrastEvidence = saturate(
+        (maxCardinalChromaDelta - FINE_DETAIL_CONTRAST_FLOOR)
+        * FINE_DETAIL_CONTRAST_GAIN);
+
+    // Preserve some protection for coherent Cb/Cr contours, including edges that
+    // do not form a perfectly symmetric gradient pattern.
+    float fineDetailConfidence = saturate(max(
+        tangentSupport * detailContrastEvidence,
+        0.70 * coherentChromaEdge));
+
+    // --- 3) Guided 5x5 sample weights --------------------------------------
+    // A compact [1,2,3,2,1] spatial profile is reduced across luminance and
+    // chromatic edges to limit colour bleeding across contours.
+    float w00 = guidedWeight(c00.x, centreY, float2(-2,-2), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 1.0);
+    float w01 = guidedWeight(c01.x, centreY, float2(-1,-2), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 2.0);
+    float w02 = guidedWeight(c02.x, centreY, float2( 0,-2), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 3.0);
+    float w03 = guidedWeight(c03.x, centreY, float2( 1,-2), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 2.0);
+    float w04 = guidedWeight(c04.x, centreY, float2( 2,-2), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 1.0);
+
+    float w10 = guidedWeight(c10.x, centreY, float2(-2,-1), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 2.0);
+    float w11 = guidedWeight(c11.x, centreY, float2(-1,-1), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 4.0);
+    float w12 = guidedWeight(c12.x, centreY, float2( 0,-1), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 6.0);
+    float w13 = guidedWeight(c13.x, centreY, float2( 1,-1), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 4.0);
+    float w14 = guidedWeight(c14.x, centreY, float2( 2,-1), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 2.0);
+
+    float w20 = guidedWeight(c20.x, centreY, float2(-2, 0), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 3.0);
+    float w21 = guidedWeight(c21.x, centreY, float2(-1, 0), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 6.0);
+    float w23 = guidedWeight(c23.x, centreY, float2( 1, 0), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 6.0);
+    float w24 = guidedWeight(c24.x, centreY, float2( 2, 0), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 3.0);
+
+    float w30 = guidedWeight(c30.x, centreY, float2(-2, 1), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 2.0);
+    float w31 = guidedWeight(c31.x, centreY, float2(-1, 1), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 4.0);
+    float w32 = guidedWeight(c32.x, centreY, float2( 0, 1), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 6.0);
+    float w33 = guidedWeight(c33.x, centreY, float2( 1, 1), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 4.0);
+    float w34 = guidedWeight(c34.x, centreY, float2( 2, 1), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 2.0);
+
+    float w40 = guidedWeight(c40.x, centreY, float2(-2, 2), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 1.0);
+    float w41 = guidedWeight(c41.x, centreY, float2(-1, 2), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 2.0);
+    float w42 = guidedWeight(c42.x, centreY, float2( 0, 2), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 3.0);
+    float w43 = guidedWeight(c43.x, centreY, float2( 1, 2), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 2.0);
+    float w44 = guidedWeight(c44.x, centreY, float2( 2, 2), lumaNormal, lumaEdgeConfidence, chromaNormal, chromaEdgeConfidence, 1.0);
+
+    float wideW = w00+w01+w02+w03+w04 + w10+w11+w12+w13+w14
+                + w20+w21+9.0+w23+w24 + w30+w31+w32+w33+w34
+                + w40+w41+w42+w43+w44;
+
+    float2 weightedChroma =
+          c00.yz*w00+c01.yz*w01+c02.yz*w02+c03.yz*w03+c04.yz*w04
+        + c10.yz*w10+c11.yz*w11+c12.yz*w12+c13.yz*w13+c14.yz*w14
+        + c20.yz*w20+c21.yz*w21+c22.yz*9.0+c23.yz*w23+c24.yz*w24
+        + c30.yz*w30+c31.yz*w31+c32.yz*w32+c33.yz*w33+c34.yz*w34
+        + c40.yz*w40+c41.yz*w41+c42.yz*w42+c43.yz*w43+c44.yz*w44;
+    float2 wideChroma = weightedChroma / wideW;
+
+    float2 weightedChromaMoment =
+          c00.yz*c00.yz*w00+c01.yz*c01.yz*w01+c02.yz*c02.yz*w02+c03.yz*c03.yz*w03+c04.yz*c04.yz*w04
+        + c10.yz*c10.yz*w10+c11.yz*c11.yz*w11+c12.yz*c12.yz*w12+c13.yz*c13.yz*w13+c14.yz*c14.yz*w14
+        + c20.yz*c20.yz*w20+c21.yz*c21.yz*w21+c22.yz*c22.yz*9.0+c23.yz*c23.yz*w23+c24.yz*c24.yz*w24
+        + c30.yz*c30.yz*w30+c31.yz*c31.yz*w31+c32.yz*c32.yz*w32+c33.yz*c33.yz*w33+c34.yz*c34.yz*w34
+        + c40.yz*c40.yz*w40+c41.yz*c41.yz*w41+c42.yz*c42.yz*w42+c43.yz*c43.yz*w43+c44.yz*c44.yz*w44;
+
+    // The local 3x3 estimate responds more closely to small features.
+    float localW = w11+w12+w13+w21+9.0+w23+w31+w32+w33;
+    float2 localChroma = (
+          c11.yz*w11+c12.yz*w12+c13.yz*w13
+        + c21.yz*w21+c22.yz*9.0+c23.yz*w23
+        + c31.yz*w31+c32.yz*w32+c33.yz*w33) / localW;
+
+    // --- 4) Source-structure analysis --------------------------------------
+    // Weighted luminance spread estimates local texture. More texture reduces
+    // the influence of the wider chroma estimate.
+    float weightedLuma =
+          c00.x*w00+c01.x*w01+c02.x*w02+c03.x*w03+c04.x*w04
+        + c10.x*w10+c11.x*w11+c12.x*w12+c13.x*w13+c14.x*w14
+        + c20.x*w20+c21.x*w21+c22.x*9.0+c23.x*w23+c24.x*w24
+        + c30.x*w30+c31.x*w31+c32.x*w32+c33.x*w33+c34.x*w34
+        + c40.x*w40+c41.x*w41+c42.x*w42+c43.x*w43+c44.x*w44;
+    float weightedLumaMoment =
+          c00.x*c00.x*w00+c01.x*c01.x*w01+c02.x*c02.x*w02+c03.x*c03.x*w03+c04.x*c04.x*w04
+        + c10.x*c10.x*w10+c11.x*c11.x*w11+c12.x*c12.x*w12+c13.x*c13.x*w13+c14.x*c14.x*w14
+        + c20.x*c20.x*w20+c21.x*c21.x*w21+c22.x*c22.x*9.0+c23.x*c23.x*w23+c24.x*c24.x*w24
+        + c30.x*c30.x*w30+c31.x*c31.x*w31+c32.x*c32.x*w32+c33.x*c33.x*w33+c34.x*c34.x*w34
+        + c40.x*c40.x*w40+c41.x*c41.x*w41+c42.x*c42.x*w42+c43.x*c43.x*w43+c44.x*c44.x*w44;
+
+    float meanY = weightedLuma / wideW;
+    float lumaVariance = max(weightedLumaMoment / wideW - meanY*meanY, 0.0);
+    float lumaTexture = saturate(sqrt(lumaVariance) * LUMA_TEXTURE_GAIN);
+
+    float2 chromaVariance = max(weightedChromaMoment / wideW - wideChroma*wideChroma, float2(0.0, 0.0));
+    float chromaSpread = sqrt(chromaVariance.x + chromaVariance.y);
+
+    // The wider estimate contributes more in flat regions and less near coherent
+    // chromatic edges, textured areas, and supported fine details.
+    float wideBlend = WIDE_ESTIMATE_BLEND
+                    * (1.0 - lumaEdgeConfidence)
+                    * (1.0 - chromaEdgeConfidence)
+                    * (1.0 - SOURCE_TEXTURE_REJECTION*lumaTexture)
+                    * (1.0 - FINE_DETAIL_WIDE_GUARD*fineDetailConfidence);
+    float2 targetChroma = lerp(localChroma, wideChroma, saturate(wideBlend));
+
+    // --- 5) Isolated-chroma outlier repair ---------------------------------
+    // Estimate neighbour consensus without the centre sample. Disagreement among
+    // neighbours suppresses repair around texture or mixed edges.
+    float neighbourW = max(wideW - 9.0, 0.001);
+    float2 neighbourChroma = (weightedChroma - centreChroma*9.0) / neighbourW;
+    float2 neighbourMoment = (weightedChromaMoment - centreChroma*centreChroma*9.0) / neighbourW;
+    float2 neighbourVariance = max(neighbourMoment - neighbourChroma*neighbourChroma, float2(0.0, 0.0));
+    float neighbourSpread = sqrt(neighbourVariance.x + neighbourVariance.y);
+
+    float centreOutlierDelta = sqrt(dot(centreChroma-neighbourChroma, centreChroma-neighbourChroma));
+    float outlierMagnitude = saturate((centreOutlierDelta - OUTLIER_DELTA_THRESHOLD) * OUTLIER_DELTA_GAIN);
+    float neighbourConsensus = saturate((OUTLIER_SPREAD_LIMIT - neighbourSpread) * OUTLIER_SPREAD_GAIN);
+    float rawOutlierConfidence = outlierMagnitude * neighbourConsensus
+                               * (1.0 - 0.85*lumaEdgeConfidence)
+                               * (1.0 - 0.90*coherentChromaEdge)
+                               * (1.0 - 0.35*lumaTexture);
+    float outlierConfidence = rawOutlierConfidence
+                            * (1.0 - FINE_DETAIL_OUTLIER_GUARD*fineDetailConfidence);
+
+    // The outlier stage is separate from the multiscale correction to avoid
+    // applying both corrections fully to the same isolated sample.
+
+    // --- 6) Detail-guarded main correction ---------------------------------
+    // Cb and Cr are activated independently, so a difference in one component
+    // does not automatically trigger the same correction in the other.
+    float2 chromaDelta = abs(targetChroma - centreChroma);
+    float2 changeActivity = saturate(
+        (chromaDelta - float2(CHROMA_CHANGE_FLOOR, CHROMA_CHANGE_FLOOR))
+        * CHROMA_CHANGE_GAIN);
+
+    // Fine-detail support reduces the correction. This final edge guard is modest
+    // because the guided sample weights already limit contributions across edges.
+    float finalEdgeGuard = (1.0 - FINAL_LUMA_EDGE_GUARD*lumaEdgeConfidence)
+                         * (1.0 - FINAL_CHROMA_EDGE_GUARD*chromaEdgeConfidence);
+    float2 correctionChroma = MAX_CHROMA_REPAIR * changeActivity
+                            * (1.0 - FINE_DETAIL_MAIN_GUARD*fineDetailConfidence)
+                            * finalEdgeGuard;
+    float2 resultChroma = lerp(centreChroma, targetChroma, correctionChroma);
+
+    // Outlier repair uses a joint Cb/Cr decision to avoid correcting a small colour
+    // anomaly too aggressively. Independent channel activation is used only by
+    // the main multiscale correction.
+    resultChroma = lerp(resultChroma, neighbourChroma,
+                        saturate(outlierConfidence * OUTLIER_REPAIR_STRENGTH));
+
+#if DEBUG_MODE != 0
+    // Diagnostic quantities are used only in diagnostic modes. Nonlinear display
+    // scaling makes weaker signals easier to see on an 8-bit output.
+    float targetDeltaDebug = chromaDistance(targetChroma, centreChroma);
+    float actualDeltaDebug = chromaDistance(resultChroma, centreChroma);
+    float actualCorrectionDebug = saturate(sqrt(actualDeltaDebug * 1200.0));
+    float targetCorrectionDebug = saturate(sqrt(targetDeltaDebug * 900.0));
+    float outlierDeltaDebug = saturate(sqrt(centreOutlierDelta * 18.0));
+    float outlierMagnitudeDebug = saturate(sqrt(outlierMagnitude) * 1.8);
+    float neighbourSpreadDebug = saturate(sqrt(neighbourSpread / max(OUTLIER_SPREAD_LIMIT, 0.0001)));
+    float outlierConfidenceDebug = saturate(sqrt(outlierConfidence) * 3.5);
+#endif
+
+    // Independent compile-time branches improve compatibility with HLSL preprocessors
+    // used by different player renderers.
+#if DEBUG_MODE == 1
+    return float4(1.0, 0.0, 1.0, 1.0);
+#endif
+#if DEBUG_MODE == 2
+    return float4(fineDetailConfidence, fineDetailConfidence,
+                  fineDetailConfidence, 1.0);
+#endif
+#if DEBUG_MODE == 3
+    // Red = outlier magnitude; green = neighbour spread; blue = repair confidence.
+    return float4(outlierMagnitudeDebug, neighbourSpreadDebug,
+                  outlierConfidenceDebug, 1.0);
+#endif
+#if DEBUG_MODE == 4
+    // Diagnostic channels: red = applied correction, green = fine-detail protection,
+    // blue = centre-to-neighbour chroma difference.
+    return float4(actualCorrectionDebug,
+                  saturate(sqrt(fineDetailConfidence)),
+                  outlierDeltaDebug, 1.0);
+#endif
+#if DEBUG_MODE == 5
+    // Diagnostic output showing the correction strength in grayscale.
+    return float4(actualCorrectionDebug, actualCorrectionDebug,
+                  actualCorrectionDebug, 1.0);
+#endif
+#if DEBUG_MODE == 6
+    // Requested target chroma difference before the final correction gain.
+    return float4(targetCorrectionDebug, targetCorrectionDebug,
+                  targetCorrectionDebug, 1.0);
+#endif
+#if DEBUG_MODE == 0
+    // Reconstruct RGB while preserving centre luminance. Main-stage Cb and Cr
+    // corrections are independent; outlier repair uses a joint chroma decision.
+    float red   = centreY + 1.402000 * resultChroma.y;
+    float green = centreY - 0.344136 * resultChroma.x - 0.714136 * resultChroma.y;
+    float blue  = centreY + 1.772000 * resultChroma.x;
+    return float4(red, green, blue, c22.a);
+#endif
+    // Fallback for an unsupported DEBUG_MODE value.
+    return float4(1.0, 0.0, 1.0, 1.0);
+#endif // DEBUG_MODE 7 branch
+#endif // DEBUG_MODE 5 branch
+#endif // DEBUG_MODE 4 branch
+#endif // DEBUG_MODE 1 branch
+}

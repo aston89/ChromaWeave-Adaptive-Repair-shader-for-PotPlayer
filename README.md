@@ -37,7 +37,7 @@ The shader combines several local decisions:
 These mechanisms are designed to cooperate. No single test can perfectly distinguish every compression artefact from every genuine colour detail, so decisions are based on several signals rather than one threshold alone.
 
 ## What it does not do
-ChromaWeave is deliberately narrower than a full video restoration or upscaling system.
+ is deliberately narrower than a full video restoration or upscaling system.
 
 - It **does not** access the decoder's native YV12/YUV 4:2:0 planes. It receives an RGB texture and derives an internal Y/Cb/Cr-like representation from it.
 - It **cannot restore colour information that was discarded** by chroma subsampling, compression or an earlier conversion. It can only make a spatially informed correction to the decoded image.
@@ -48,13 +48,13 @@ ChromaWeave is deliberately narrower than a full video restoration or upscaling 
 
 ## Where it fits in the pipeline
 
-ChromaWeave is intended for the **pre-resize** stage:
+ is intended for the **pre-resize** stage:
 
 ```text
 Decoded source frame
         |
         v
-ChromaWeave Adaptive Repair  [Pre-Resize]
+ Adaptive Repair  [Pre-Resize]
         |
         v
 Renderer resize / upscale
@@ -70,13 +70,13 @@ Display output
 
 The division of labour is intentional:
 
-1. **ChromaWeave prepares the source** by reducing selected colour inconsistencies before they are enlarged.
-2. **The renderer's resizer creates the output-sized image.** ChromaWeave is not a replacement for Spline, B-Spline, DXVA-HD or another scaler.
-3. **A post-resize shader may refine the final contours.** EdgeWeave_LX is one example of a complementary downstream stage; it is not required by ChromaWeave itself.
+1. ** prepares the source** by reducing selected colour inconsistencies before they are enlarged.
+2. **The renderer's resizer creates the output-sized image.**  is not a replacement for Spline, B-Spline, DXVA-HD or another scaler.
+3. **A post-resize shader may refine the final contours.** EdgeWeave_LX is one example of a complementary downstream stage; it is not required by  itself.
 
 ## Installation in PotPlayer
 
-1. Save `chromaweave.txt` into the custom pixel-shader location used by your PotPlayer installation.
+1. Save `ChromaWeave_Adaptive_Repair.txt` into the custom pixel-shader location used by your PotPlayer installation.
 2. Open PotPlayer's video pixel-shader controls and add/select the shader in the **Pre-Resize Pixel Shaders** stage. Menu wording may vary by version or localisation.
 3. Keep it out of the post-resize stage. Its sample offsets are intended to operate on the decoded source-size texture.
 4. For a baseline comparison, disable other chroma-preparation shaders and keep the renderer's resize filter and post-resize shaders unchanged.

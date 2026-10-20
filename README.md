@@ -152,7 +152,7 @@ Modes 4, 5, and 7 deliberately use early, lightweight diagnostic calculations to
 - **Sampling:** the main image path samples a 5×5 source neighbourhood (25 texture fetches per output pixel), plus additional arithmetic for edge guidance, variance estimates, and repair confidence.
 - **Placement:** pre-resize, where the shader works on the source-size frame rather than processing the full enlarged output.
 - **Expected cost:** depends on resolution, GPU, driver, renderer, and shader compiler. No universal frame-rate guarantee is made.
-- **Compatibility:** the shader was tested in the PotPlayer pipeline and reports successful use across multiple films. Other players (mpc-hc, vlc, etc etc) should be compatible, just change the extension fronm "txt" to "hlsl" and it should work even on older gpu's.
+- **Compatibility:** the shader was tested in the PotPlayer pipeline and reports successful use across multiple films. Other players like mpc-hc and forked variants are almost guaranteed to work, for vlc it need testing because it does support a specific post-resize chain only, just change the extension fronm ".txt" to ".hlsl" and it should work also on older gpu's.
 
 ## Benefits Limitations Compatibility
 Less upscaling (resize) artifacts like banding, blocking etc etc.

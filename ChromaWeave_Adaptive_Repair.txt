@@ -548,8 +548,11 @@ float4 main(float2 tex : TEXCOORD0) : COLOR
                   outlierConfidenceDebug, 1.0);
 #endif
 #if DEBUG_MODE == 4
-    // Diagnostic channels: red = applied correction, green = fine-detail protection,
-    // blue = centre-to-neighbour chroma difference.
+    // Legacy full-pipeline diagnostic branch. This branch is not active for
+    // DEBUG_MODE 4: the earlier top-level branch returns the lightweight
+    // 8-neighbour activity proxy before the full pipeline is compiled.
+    // If re-enabled, R = applied correction, G = fine-detail protection,
+    // B = scaled centre-to-neighbour chroma deviation.
     return float4(actualCorrectionDebug,
                   saturate(sqrt(fineDetailConfidence)),
                   outlierDeltaDebug, 1.0);

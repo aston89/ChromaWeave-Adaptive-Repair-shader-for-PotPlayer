@@ -1,6 +1,5 @@
 /*
-    ChromaWeave Adaptive Repair — pre-resize chroma cleanup
-    Version: 1.0
+    ChromaWeave Adaptive Repair v1.0
 
     Purpose:
       Reduce selected chroma irregularities before resizing, while protecting

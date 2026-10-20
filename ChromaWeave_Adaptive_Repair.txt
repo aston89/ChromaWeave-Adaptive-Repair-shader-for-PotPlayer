@@ -558,7 +558,9 @@ float4 main(float2 tex : TEXCOORD0) : COLOR
                   outlierDeltaDebug, 1.0);
 #endif
 #if DEBUG_MODE == 5
-    // Diagnostic output showing the correction strength in grayscale.
+    // Legacy full-pipeline correction-strength view. This branch is not
+    // active for DEBUG_MODE 5: the earlier top-level branch returns the
+    // raw 8-neighbour chroma-deviation map before the full pipeline.
     return float4(actualCorrectionDebug, actualCorrectionDebug,
                   actualCorrectionDebug, 1.0);
 #endif

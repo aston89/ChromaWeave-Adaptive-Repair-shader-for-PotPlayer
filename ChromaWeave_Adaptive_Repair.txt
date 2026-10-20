@@ -57,15 +57,23 @@ float4 p1 : register(c1);
 #define WIDE_ESTIMATE_BLEND        0.66
 
 // --- Fine-detail protection ---------------------------------------------
-// A neighbour is considered chromatically similar when its Cb/Cr distance
-// from the centre falls within this soft radius.
+// Similarity uses Euclidean distance in Cb/Cr space. Distances at or above
+// the radius provide no support; the gain controls how quickly support rises
+// toward 1 as the distance decreases.
 #define FINE_DETAIL_SIMILARITY_RADIUS  0.052
 #define FINE_DETAIL_SIMILARITY_GAIN   24.0
+
+// Contrast evidence starts when at least one cardinal neighbour differs
+// from the centre by more than this Cb/Cr distance.
 #define FINE_DETAIL_CONTRAST_FLOOR     0.016
+
+// Scales the excess contrast into a saturated [0,1] evidence value.
 #define FINE_DETAIL_CONTRAST_GAIN     16.0
-// Reduce broad/local repair where the neighbourhood supports a coherent fine
-// feature. Outlier protection is deliberately strongest to avoid erasing thin
-// coloured lines. Set controls to 0.0 to disable each protection path.
+
+// These multipliers reduce wide-estimate blending, the main correction, and
+// outlier repair respectively when the neighbourhood supports a coherent
+// fine feature. The outlier path receives the strongest protection.
+// Set any one of these multipliers to 0.0 to disable its corresponding guard.
 #define FINE_DETAIL_WIDE_GUARD         0.88
 #define FINE_DETAIL_MAIN_GUARD         0.86
 #define FINE_DETAIL_OUTLIER_GUARD      0.98
